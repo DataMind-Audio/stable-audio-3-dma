@@ -61,12 +61,18 @@ class StableAudioModel:
         model.lora_names = []
         return StableAudioModel(model, model_config, device, model_half)
 
-    def load_lora(self, lora_ckpt_paths):
-        """Load LoRA checkpoints onto the model after construction."""
+    def load_lora(self, lora_ckpt_paths, start_index=0):
+        """Load LoRA checkpoints onto the model after construction.
+
+        start_index: pass the count of LoRAs already loaded onto this model to
+        add more incrementally, without re-registering (and thereby stacking
+        on top of) the ones already there.
+        """
         model_type = self.model_config["model_type"]
         svd_bases_path = self.model_config.get("svd_bases_path")
         load_and_apply_loras(
-            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path
+            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path,
+            start_index=start_index,
         )
 
     def set_lora_strength(self, strength: float, lora_index: int | None = None):

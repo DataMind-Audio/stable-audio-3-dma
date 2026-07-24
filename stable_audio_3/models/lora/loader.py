@@ -16,7 +16,7 @@ from .utils import (
 from ...verbose import vprint
 
 
-def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None):
+def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None, start_index=0):
     """Load LoRA checkpoints from disk and attach them to `model`.
 
     - Uses a two-pass approach: first resolves each LoRA's adapter type, then
@@ -35,13 +35,20 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
         model_type: String from the model config, e.g. "diffusion_cond".
         svd_bases_path: Optional path to a precomputed SVD bases .pt file
             (used only by -XS adapter types).
+        start_index: lora_index to assign to the first path in this call.
+            Callers adding LoRAs incrementally onto a model that already has
+            `start_index` LoRAs registered (e.g. an earlier load_and_apply_loras
+            call) must pass that count here — parametrizations register by
+            appending, so re-using an index that's already registered stacks a
+            second transform on top of the first rather than replacing it.
 
     Returns:
         List of display names (file stems) in the same order as the input paths.
     """
     if not lora_ckpt_paths:
-        model.use_lora = False
-        model.lora_names = []
+        if start_index == 0:
+            model.use_lora = False
+            model.lora_names = []
         return []
 
     is_cond = model_type in ("diffusion_cond", "diffusion_cond_inpaint")
@@ -71,9 +78,13 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
         else:
             print("WARNING: -XS adapter type present without svd_bases_path -- SVD will be computed on current device")
 
-    # Pass 2: apply each LoRA.
+    # Pass 2: apply each LoRA. global_index is this LoRA's position among ALL
+    # LoRAs ever registered on this model (not just this call) — it must match
+    # where register_parametrization will land it in each layer's existing
+    # parametrization list, so start_index has to equal the count already there.
     lora_names = []
     for i, (lora_path, state_dict, config_dict, adapter_type) in enumerate(lora_entries):
+        global_index = start_index + i
         rank = config_dict.get("rank", infer_global_rank(state_dict))
         alpha = config_dict.get("alpha", rank)
         include = config_dict.get("include", None)
@@ -82,10 +93,10 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
 
         lora_config = {
             torch.nn.Linear: {
-                "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i),
+                "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=global_index),
             },
             torch.nn.Conv1d: {
-                "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=i),
+                "weight": partial(LoRAParametrization.from_conv1d, rank=rank, lora_alpha=alpha, adapter_type=adapter_type, lora_index=global_index),
             },
         }
         if is_cond:
@@ -98,7 +109,7 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
                      svd_bases=model_svd_bases if is_xs else None)
 
         prepare_dora_state_dict(state_dict)
-        remapped_sd = remap_lora_state_dict(state_dict, i)
+        remapped_sd = remap_lora_state_dict(state_dict, global_index)
         if is_cond:
             model.model.load_state_dict(remapped_sd, strict=False)
             model.conditioner.load_state_dict(remapped_sd, strict=False)
@@ -108,5 +119,5 @@ def load_and_apply_loras(model, lora_ckpt_paths, model_type, svd_bases_path=None
 
     vprint("lora layers:", len(get_lora_layers(model)))
     model.use_lora = True
-    model.lora_names = lora_names
+    model.lora_names = (model.lora_names if start_index and hasattr(model, "lora_names") else []) + lora_names
     return lora_names
