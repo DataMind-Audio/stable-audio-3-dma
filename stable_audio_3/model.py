@@ -9,6 +9,7 @@ from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
 from stable_audio_3.model_configs import ae_models, all_models
 from stable_audio_3.models.lora import (
+    canonicalize_lora_order as _canonicalize_lora_order,
     set_lora_strength as _set_lora_strength,
     load_and_apply_loras,
 )
@@ -78,6 +79,15 @@ class StableAudioModel:
     def set_lora_strength(self, strength: float, lora_index: int | None = None):
         _set_lora_strength(self.model.model, strength, lora_index=lora_index)
         _set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
+
+    def canonicalize_lora_order(self, key_fn) -> int:
+        """Sort every layer's attached LoRAs into ``key_fn(lora_index)`` order so
+        the composition order depends only on which LoRAs are attached, not on
+        the order this process attached them. Call after each ``load_lora``.
+        See ``models.lora.canonicalize_lora_order`` for why DoRA needs this.
+        Returns the number of layers reordered."""
+        return (_canonicalize_lora_order(self.model.model, key_fn)
+                + _canonicalize_lora_order(self.model.conditioner, key_fn))
 
     @torch.inference_mode()
     def generate(
