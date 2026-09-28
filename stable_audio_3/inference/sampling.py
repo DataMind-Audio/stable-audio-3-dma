@@ -193,6 +193,16 @@ def sample_rk4(model, x, sigmas, callback=None, disable_tqdm=False, **extra_args
         sigmas: Pre-computed schedule tensor of shape (steps+1,).
             Per-element schedules not supported for RK4.
     """
+    # A per-element schedule (batch_size, steps+1) — which is what every
+    # distribution shift returns, and therefore what generate() passes — used
+    # to be zipped over its ROWS below: batch size 1 ran zero steps and the
+    # caller got its input noise back as the "sample". Refuse it instead of
+    # returning noise; tests/test_schedule_shapes.py pins this.
+    if sigmas.dim() != 1:
+        raise ValueError(
+            f"sample_rk4 needs a global schedule of shape (steps+1,), got {tuple(sigmas.shape)}; "
+            "per-element schedules are not supported by RK4 — use euler, dpmpp or pingpong")
+
     # Make tensor of ones to broadcast the single t values
     ts = x.new_ones([x.shape[0]])
 
