@@ -469,3 +469,49 @@ def _iter_lora_params(model):
         for p in plist:
             if isinstance(p, LoRAParametrization):
                 yield p
+
+
+def canonicalize_lora_order(model, key_fn):
+    """Reorder every layer's LoRA parametrizations into ascending ``key_fn(lora_index)``
+    order, so the composition order is a function of WHICH adapters are attached and
+    never of WHEN they were attached.
+
+    Why this exists. torch composes stacked parametrizations in registration order,
+    and DoRA is not commutative under composition: each adapter re-normalises the
+    weight it receives and rescales it by its own trained magnitude, so
+    ``DoRA_b(DoRA_a(W))`` and ``DoRA_a(DoRA_b(W))`` differ — the LAST adapter's
+    magnitude sets every final row norm. When adapters attach lazily on first use,
+    two processes that attached the same set in a different order render the same
+    blend differently from the same seed. Sorting after every attach removes the
+    history from the stack.
+
+    Only positions move. Every helper in this package (`set_lora_strength`,
+    `enable_lora`, `disable_lora`, `filter_lora_layers`) addresses adapters by the
+    ``lora_index`` TAG stored on each module, not by list position, so tags,
+    loaded weights and strengths are untouched. An adapter at strength 0 is an
+    exact identity, so inactive adapters may sit anywhere; sorting all of them is
+    simply the cheapest way to make the order total.
+
+    Returns the number of layers whose order changed. O(layers × adapters) pointer
+    moves, no tensor work — cheap enough to run after every attach.
+    """
+    changed = 0
+    for _, mod in model.named_modules():
+        plist = getattr(getattr(mod, "parametrizations", None), "weight", None)
+        if plist is None:
+            continue
+        slots = [i for i, p in enumerate(plist) if isinstance(p, LoRAParametrization)]
+        if len(slots) < 2:
+            continue
+        current = [plist[i] for i in slots]
+        wanted = sorted(current, key=lambda p: key_fn(p.lora_index))
+        if all(a is b for a, b in zip(current, wanted)):
+            continue
+        # ModuleList.__setitem__ rebinds child "i". Writing the whole permutation
+        # from a pre-collected list keeps every module reachable throughout, and
+        # ParametrizationList.forward walks "0", "1", … by name, so the new
+        # positions ARE the new composition order.
+        for i, p in zip(slots, wanted):
+            plist[i] = p
+        changed += 1
+    return changed

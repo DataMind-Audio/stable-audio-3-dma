@@ -1,4 +1,13 @@
-from .model import LoRAParametrization, add_lora, default_lora_config, merge_lora, remove_lora, remove_lora_by_index, set_lora_strength
+from .model import (
+    LoRAParametrization,
+    add_lora,
+    canonicalize_lora_order,
+    default_lora_config,
+    merge_lora,
+    remove_lora,
+    remove_lora_by_index,
+    set_lora_strength,
+)
 from .utils import (
     apply_to_lora,
     convert_lora_ckpt_to_safetensors,

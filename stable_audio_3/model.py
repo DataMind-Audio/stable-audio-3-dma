@@ -9,6 +9,7 @@ from stable_audio_3.inference.sampling import sample_diffusion
 from stable_audio_3.loading_utils import load_autoencoder, load_diffusion_cond
 from stable_audio_3.model_configs import ae_models, all_models
 from stable_audio_3.models.lora import (
+    canonicalize_lora_order as _canonicalize_lora_order,
     set_lora_strength as _set_lora_strength,
     load_and_apply_loras,
 )
@@ -61,17 +62,32 @@ class StableAudioModel:
         model.lora_names = []
         return StableAudioModel(model, model_config, device, model_half)
 
-    def load_lora(self, lora_ckpt_paths):
-        """Load LoRA checkpoints onto the model after construction."""
+    def load_lora(self, lora_ckpt_paths, start_index=0):
+        """Load LoRA checkpoints onto the model after construction.
+
+        start_index: pass the count of LoRAs already loaded onto this model to
+        add more incrementally, without re-registering (and thereby stacking
+        on top of) the ones already there.
+        """
         model_type = self.model_config["model_type"]
         svd_bases_path = self.model_config.get("svd_bases_path")
         load_and_apply_loras(
-            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path
+            self.model, lora_ckpt_paths, model_type, svd_bases_path=svd_bases_path,
+            start_index=start_index,
         )
 
     def set_lora_strength(self, strength: float, lora_index: int | None = None):
         _set_lora_strength(self.model.model, strength, lora_index=lora_index)
         _set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
+
+    def canonicalize_lora_order(self, key_fn) -> int:
+        """Sort every layer's attached LoRAs into ``key_fn(lora_index)`` order so
+        the composition order depends only on which LoRAs are attached, not on
+        the order this process attached them. Call after each ``load_lora``.
+        See ``models.lora.canonicalize_lora_order`` for why DoRA needs this.
+        Returns the number of layers reordered."""
+        return (_canonicalize_lora_order(self.model.model, key_fn)
+                + _canonicalize_lora_order(self.model.conditioner, key_fn))
 
     @torch.inference_mode()
     def generate(
