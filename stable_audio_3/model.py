@@ -115,6 +115,11 @@ class StableAudioModel:
         inpaint_mask=None,
         inpaint_mask_start_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
         inpaint_mask_end_seconds: tp.Optional[tp.Union[float, tp.List[float]]] = None,
+        # Pre-encoded latents in place of audio inputs (Kollektiv: a render
+        # plan hands one pass's latent to the next without decoding it)
+        init_latent: tp.Optional[torch.Tensor] = None,
+        inpaint_latent: tp.Optional[torch.Tensor] = None,
+        truncate_schedule: bool = False,
         # Schedule options
         duration_padding_sec: float = 6.0,
         apg_scale: float = 1.0,
@@ -155,6 +160,12 @@ class StableAudioModel:
                 for a single region, or a list of floats for multiple non-contiguous regions.
             inpaint_mask_end_seconds: End of the inpaint region in seconds. Can be a float
                 for a single region, or a list of floats matching inpaint_mask_start_seconds.
+            init_latent: A latent tensor of shape (1, C, T) — as generate(..., return_latents=True) returns it for the
+                same duration — used as the init in place of init_audio (no encode). Mixed with noise by init_noise_level.
+            inpaint_latent: The same, as the inpaint source in place of inpaint_audio; the mask comes from
+                inpaint_mask_start_seconds/inpaint_mask_end_seconds as usual.
+            truncate_schedule: With an init, start the schedule AT init_noise_level and only fall from there
+                (sampling.build_schedule truncate_to_sigma_max). Default False: the pinned schedule as before.
             duration_padding_sec: Extra seconds to add when adapting duration (default 6.0).
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
@@ -274,21 +285,34 @@ class StableAudioModel:
         else:
             negative_conditioning_tensors = {}
 
-        # Process init audio
+        def _as_latent(lat, name):
+            # a pre-encoded latent for this exact window: (1, C, T) at latent_sample_size
+            if lat.dim() != 3 or lat.shape[0] != 1 or lat.shape[-1] != latent_sample_size:
+                raise ValueError(
+                    f"{name} must have shape (1, C, {latent_sample_size}) for this duration, got {tuple(lat.shape)}"
+                )
+            return lat.to(device).repeat(batch_size, 1, 1)
+
+        # Process init audio (or a latent handed over from a previous pass)
         if init_audio is not None:
             init_audio, inpaint_mask = self._encode_audio_input(
                 init_audio, audio_sample_size, inpaint_mask
             )
             init_audio = init_audio.repeat(batch_size, 1, 1)
+        elif init_latent is not None:
+            init_audio = _as_latent(init_latent, "init_latent")
 
-        # Process inpaint audio
+        # Process inpaint audio (or a latent); the sample-domain mask is brought
+        # to latent length here when no encode did it
         if inpaint_audio is not None:
             inpaint_audio, inpaint_mask = self._encode_audio_input(
                 inpaint_audio, audio_sample_size, inpaint_mask
             )
             inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
         else:
-            if inpaint_mask is not None:
+            if inpaint_latent is not None:
+                inpaint_audio = _as_latent(inpaint_latent, "inpaint_latent")
+            if inpaint_mask is not None and inpaint_mask.shape[-1] != latent_sample_size:
                 inpaint_mask = interpolate(
                     inpaint_mask.unsqueeze(1), size=latent_sample_size, mode="nearest"
                 ).squeeze(1)
@@ -352,6 +376,7 @@ class StableAudioModel:
             apg_scale=apg_scale,
             init_data=init_audio,
             init_noise_level=init_noise_level,
+            truncate_schedule=truncate_schedule,
             decode=not return_latents,
             chunked_decode=chunked_decode,
             **sampler_kwargs,

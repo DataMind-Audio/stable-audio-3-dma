@@ -66,3 +66,49 @@ def test_rk4_still_samples_a_global_schedule():
                               callback=lambda info: seen.append(int(info["i"])), disable_tqdm=True)
     assert seen == list(range(steps))
     assert not torch.equal(out, x)
+
+
+# ---- truncate_to_sigma_max: a schedule that starts at the init's noise level and only falls ----------------------------
+# The default path shifts linspace(sigma_max, 0) and pins the first point, so from sigma_max 0.8 the second step is back
+# near the top of the shifted curve (≈ 0.98 with the medium model's LogSNR shift): a "part-way down" start is re-noised.
+# The truncated path enters the shifted curve where it equals sigma_max, so the whole schedule is monotone from there.
+
+def _logsnr_shift():
+    from stable_audio_3.inference.distribution_shift import LogSNRShift
+    return LogSNRShift(anchor_length=2000, anchor_logsnr=-6.2, rate=0.0, logsnr_end=2.0)
+
+
+def test_default_schedule_renoises_after_a_low_sigma_max():
+    sig = sampling.build_schedule(8, sigma_max=0.8, dist_shift=_logsnr_shift(), fallback_seq_len=2000)
+    assert abs(float(sig[0]) - 0.8) < 1e-6 and float(sig[1]) > 0.9   # the trap the truncated form exists for
+
+
+def test_truncated_schedule_is_monotone_from_sigma_max():
+    shift = _logsnr_shift()
+    for smax in (0.95, 0.8, 0.5):
+        sig = sampling.build_schedule(8, sigma_max=smax, dist_shift=shift, fallback_seq_len=2000, truncate_to_sigma_max=True)
+        assert sig.shape == (9,)
+        assert abs(float(sig[0]) - smax) < 1e-6, (smax, sig)
+        assert float(sig[-1]) == 0.0
+        assert all(float(sig[i + 1]) < float(sig[i]) for i in range(8)), (smax, sig)
+        # it is the same shifted curve, entered lower: every later point lies on the full curve's range
+        full = sampling.build_schedule(8, sigma_max=1.0, dist_shift=shift, fallback_seq_len=2000)
+        assert float(sig[1]) < float(full[1])
+
+
+def test_truncated_schedule_per_element_gives_one_row_each():
+    shift = _logsnr_shift()
+    sig = sampling.build_schedule(4, sigma_max=0.8, dist_shift=shift, effective_seq_len=torch.tensor([2000, 4000]),
+                                  fallback_seq_len=2000, truncate_to_sigma_max=True)
+    assert sig.shape == (2, 5)
+    assert torch.allclose(sig[:, 0], torch.tensor([0.8, 0.8]))
+    assert bool((sig[:, 1:] < sig[:, :-1]).all())
+
+
+def test_truncation_is_a_no_op_at_sigma_max_1_and_without_a_shift():
+    shift = _logsnr_shift()
+    a = sampling.build_schedule(6, sigma_max=1.0, dist_shift=shift, fallback_seq_len=2000)
+    b = sampling.build_schedule(6, sigma_max=1.0, dist_shift=shift, fallback_seq_len=2000, truncate_to_sigma_max=True)
+    assert torch.equal(a, b)
+    c = sampling.build_schedule(6, sigma_max=0.7, truncate_to_sigma_max=True)
+    assert torch.allclose(c, torch.linspace(0.7, 0, 7))

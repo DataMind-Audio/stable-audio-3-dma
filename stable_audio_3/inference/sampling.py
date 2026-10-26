@@ -14,8 +14,19 @@ def build_schedule(
     fallback_seq_len: tp.Optional[int] = None,
     include_endpoint: bool = True,
     device: tp.Union[str, torch.device] = "cpu",
+    truncate_to_sigma_max: bool = False,
 ) -> torch.Tensor:
     """Build a timestep schedule for diffusion sampling.
+
+    truncate_to_sigma_max (Kollektiv): with a dist_shift and sigma_max < 1,
+    enter the SHIFTED curve where it equals sigma_max instead of shifting a
+    linspace that starts at sigma_max and then pinning the first point. The
+    default keeps σ₀ = sigma_max but the second step lands back where the
+    shifted curve would be from σ 1 (at sigma_max 0.8 with the medium model's
+    LogSNR shift it is ≈ 0.98), so a variation starting "part-way down" is
+    re-noised almost to the top on step 2. Truncated, the schedule starts at
+    sigma_max and only falls, so an init at noise level 0.8 means 0.8. Off by
+    default: existing callers' schedules are unchanged.
 
     Returns a 1D tensor of shape (N,) where N = steps+1 (if include_endpoint)
     or steps (if not), OR a 2D tensor of shape (batch_size, N) when
@@ -48,7 +59,10 @@ def build_schedule(
         elif seq_len is not None:
             # Clamp scalar sequence length to at least 1
             seq_len = max(int(seq_len), 1)
-        t = dist_shift.shift(t, seq_len)
+        if truncate_to_sigma_max and 0.0 < sigma_max < 1.0:
+            t = _truncated_shifted_schedule(dist_shift, seq_len, sigma_max, n_points, include_endpoint, device)
+        else:
+            t = dist_shift.shift(t, seq_len)
 
         # Ensure the first timestep remains aligned with sigma_max after shifting.
         # This keeps the schedule consistent with the initialization in sample_diffusion(),
@@ -62,6 +76,32 @@ def build_schedule(
                 t[..., 0] = sigma_max_tensor
 
     return t
+
+
+def _truncated_shifted_schedule(dist_shift, seq_len, sigma_max, n_points, include_endpoint, device):
+    """The shifted curve entered where it equals sigma_max (build_schedule's
+    truncate_to_sigma_max). The shift is monotone in t, so the entry point is
+    found by bisection on the scalar curve, then a linspace from there to 0
+    is shifted as usual. Per-element sequence lengths (a 1-D tensor) give one
+    row per element, like dist_shift.shift does for the default path."""
+    n = n_points if include_endpoint else n_points + 1
+
+    def one(sl):
+        lo, hi = 0.0, 1.0
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            v = float(dist_shift.shift(torch.tensor([mid], device=device), sl)[0])
+            if v < sigma_max:
+                lo = mid
+            else:
+                hi = mid
+        x0 = (lo + hi) / 2
+        row = dist_shift.shift(torch.linspace(x0, 0, n, device=device), sl)
+        return row if include_endpoint else row[:-1]
+
+    if isinstance(seq_len, torch.Tensor) and seq_len.dim() == 1:
+        return torch.stack([one(int(s)) for s in seq_len.tolist()])
+    return one(seq_len)
 
 
 def sample_timesteps_logsnr(batch_size, mean_logsnr=-1.2, std_logsnr=2.0):
@@ -389,6 +429,7 @@ def sample_diffusion(
     # Init data (variation / img2img)
     init_data: tp.Optional[torch.Tensor] = None,
     init_noise_level: float = 1.0,
+    truncate_schedule: bool = False,
     # Other
     callback = None,
     disable_tqdm: bool = False,
@@ -424,6 +465,8 @@ def sample_diffusion(
         apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG
         init_data: Optional pre-encoded latent tensor for variation/img2img (shape: B, C, T)
         init_noise_level: Noise level (sigma_max) when using init_data. 1.0 = full noise (no variation).
+        truncate_schedule: With init_data, enter the shifted schedule where it equals init_noise_level
+            so σ only falls from there (build_schedule's truncate_to_sigma_max). Default False: unchanged.
         callback: Optional callback for progress reporting
         disable_tqdm: Whether to disable progress bar
         decode: Whether to decode latents using pretransform
@@ -497,7 +540,8 @@ def sample_diffusion(
         sigmas = build_schedule(
             steps=steps, sigma_max=sigma_max,
             dist_shift=dist_shift, effective_seq_len=effective_seq_len,
-            fallback_seq_len=latent_seq_len, include_endpoint=True, device=device
+            fallback_seq_len=latent_seq_len, include_endpoint=True, device=device,
+            truncate_to_sigma_max=truncate_schedule,
         )
 
         # Route to sampler
