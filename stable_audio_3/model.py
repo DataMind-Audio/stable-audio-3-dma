@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import torch
+from .rng import current_generator, generator_scope, randn as rng_randn, seeded
 import typing as tp
 from torch.nn.functional import interpolate
 
@@ -136,6 +137,7 @@ class StableAudioModel:
         negative_conditioning: tp.Optional[tp.List[dict]] = None,
         negative_conditioning_tensors: tp.Optional[dict] = None,
         seed: int = -1,
+        generator: tp.Optional[torch.Generator] = None,
         # Audio inputs
         init_audio: tp.Optional[tp.Tuple[int, torch.Tensor]] = None,
         init_noise_level: float = 1.0,
@@ -292,142 +294,151 @@ class StableAudioModel:
         if inpaint_mask is not None:
             inpaint_mask = inpaint_mask.float()
 
-        # Seed and noise
+        # Seed and noise. Every draw of this call — the initial noise, the pingpong re-noise, the
+        # decoder's token noise — comes from ONE torch.Generator: the one passed in, else the
+        # scope's (rng.generator_scope), else a fresh one seeded here. A fresh Generator(seed) yields
+        # the exact stream torch.manual_seed(seed) + the default generator did (bitwise on CUDA,
+        # 2026-10-28), so takes reproduce — and nothing touches the global RNG, so renders in other
+        # threads cannot disturb this one. seed=-1 keeps drawing a random seed as before.
         seed = seed if seed != -1 else np.random.randint(0, 99999)
-        torch.manual_seed(seed)
-        noise = torch.randn(
-            [batch_size, self.model.io_channels, latent_sample_size], device=device
-        )
-
-        # Encode conditioning
-        if conditioning_tensors is None:
-            conditioning_tensors = self.model.conditioner(conditioning, device)
-        if (
-            negative_conditioning is not None
-            or negative_conditioning_tensors is not None
-        ):
-            if negative_conditioning_tensors is None:
-                negative_conditioning_tensors = self.model.conditioner(
-                    negative_conditioning, device
-                )
-        else:
-            negative_conditioning_tensors = {}
-
-        def _as_latent(lat, name):
-            # a pre-encoded latent for this exact window: (1, C, T) at latent_sample_size
-            if lat.dim() != 3 or lat.shape[0] != 1 or lat.shape[-1] != latent_sample_size:
-                raise ValueError(
-                    f"{name} must have shape (1, C, {latent_sample_size}) for this duration, got {tuple(lat.shape)}"
-                )
-            return lat.to(device).repeat(batch_size, 1, 1)
-
-        # Process init audio (or a latent handed over from a previous pass)
-        if init_audio is not None:
-            init_audio, inpaint_mask = self._encode_audio_input(
-                init_audio, audio_sample_size, inpaint_mask
-            )
-            init_audio = init_audio.repeat(batch_size, 1, 1)
-        elif init_latent is not None:
-            init_audio = _as_latent(init_latent, "init_latent")
-
-        # Process inpaint audio (or a latent); the sample-domain mask is brought
-        # to latent length here when no encode did it
-        if inpaint_audio is not None:
-            inpaint_audio, inpaint_mask = self._encode_audio_input(
-                inpaint_audio, audio_sample_size, inpaint_mask
-            )
-            inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
-        else:
-            if inpaint_latent is not None:
-                inpaint_audio = _as_latent(inpaint_latent, "inpaint_latent")
-            if inpaint_mask is not None and inpaint_mask.shape[-1] != latent_sample_size:
-                inpaint_mask = interpolate(
-                    inpaint_mask.unsqueeze(1), size=latent_sample_size, mode="nearest"
-                ).squeeze(1)
-
-        # Build inpaint mask tensor and masked input
-        if inpaint_mask is None:
-            mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
-        else:
-            mask = inpaint_mask.unsqueeze(1)
-        mask = mask.to(device)
-
-        inpaint_input = (
-            inpaint_audio * mask.expand_as(inpaint_audio)
-            if inpaint_audio is not None
-            else torch.zeros(
-                (batch_size, self.model.io_channels, latent_sample_size), device=device
-            )
-        )
-
-        conditioning_tensors["inpaint_mask"] = [mask]
-        conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
-        conditioning_inputs = self.model.get_conditioning_inputs(conditioning_tensors)
-
-        if negative_conditioning_tensors:
-            negative_conditioning_tensors["inpaint_mask"] = [mask]
-            negative_conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
-            negative_conditioning_tensors = self.model.get_conditioning_inputs(
-                negative_conditioning_tensors, negative=True
+        if generator is None:
+            generator = current_generator()
+        if generator is None:
+            generator = seeded(seed, device)
+        with generator_scope(generator):
+            noise = rng_randn(
+                [batch_size, self.model.io_channels, latent_sample_size], device=device
             )
 
-        model_dtype = next(self.model.model.parameters()).dtype
-        noise = noise.type(model_dtype)
-        conditioning_inputs = {
-            k: v.type(model_dtype) if v is not None else v
-            for k, v in conditioning_inputs.items()
-        }
-
-        cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
-
-        sampler_type = sampler_kwargs.pop("sampler_type", None)
-
-        result = sample_diffusion(
-            model=self.model.model,
-            noise=noise,
-            cond_inputs=cond_inputs,
-            diffusion_objective=self.model.diffusion_objective,
-            steps=steps,
-            cfg_scale=cfg_scale,
-            conditioning=conditioning,
-            sample_rate=self.model.sample_rate,
-            pretransform=self.model.pretransform,
-            mask_padding_attention=True,
-            use_effective_length_for_schedule=True,
-            headroom_seconds=duration_padding_sec,
-            dist_shift=dist_shift
-            if dist_shift is not None
-            else self.model.sampling_dist_shift,
-            sampler_type=sampler_type,
-            batch_cfg=True,
-            rescale_cfg=True,
-            apg_scale=apg_scale,
-            init_data=init_audio,
-            init_noise_level=init_noise_level,
-            truncate_schedule=truncate_schedule,
-            decode=not return_latents,
-            chunked_decode=chunked_decode,
-            **sampler_kwargs,
-        )
-
-        if not return_latents:
-            result = result.to(torch.float32).clamp(-1, 1)
-
-        if not return_latents and truncate_output_to_duration:
-            if isinstance(duration, (int, float)):
-                max_length_samples = int(duration * self.model.sample_rate)
-                result = result[:, :, :max_length_samples]
+            # Encode conditioning
+            if conditioning_tensors is None:
+                conditioning_tensors = self.model.conditioner(conditioning, device)
+            if (
+                negative_conditioning is not None
+                or negative_conditioning_tensors is not None
+            ):
+                if negative_conditioning_tensors is None:
+                    negative_conditioning_tensors = self.model.conditioner(
+                        negative_conditioning, device
+                    )
             else:
-                if torch.all(torch.tensor(duration) == duration[0]):
-                    max_length_samples = int(duration[0] * self.model.sample_rate)
+                negative_conditioning_tensors = {}
+
+            def _as_latent(lat, name):
+                # a pre-encoded latent for this exact window: (1, C, T) at latent_sample_size
+                if lat.dim() != 3 or lat.shape[0] != 1 or lat.shape[-1] != latent_sample_size:
+                    raise ValueError(
+                        f"{name} must have shape (1, C, {latent_sample_size}) for this duration, got {tuple(lat.shape)}"
+                    )
+                return lat.to(device).repeat(batch_size, 1, 1)
+
+            # Process init audio (or a latent handed over from a previous pass)
+            if init_audio is not None:
+                init_audio, inpaint_mask = self._encode_audio_input(
+                    init_audio, audio_sample_size, inpaint_mask
+                )
+                init_audio = init_audio.repeat(batch_size, 1, 1)
+            elif init_latent is not None:
+                init_audio = _as_latent(init_latent, "init_latent")
+
+            # Process inpaint audio (or a latent); the sample-domain mask is brought
+            # to latent length here when no encode did it
+            if inpaint_audio is not None:
+                inpaint_audio, inpaint_mask = self._encode_audio_input(
+                    inpaint_audio, audio_sample_size, inpaint_mask
+                )
+                inpaint_audio = inpaint_audio.repeat(batch_size, 1, 1)
+            else:
+                if inpaint_latent is not None:
+                    inpaint_audio = _as_latent(inpaint_latent, "inpaint_latent")
+                if inpaint_mask is not None and inpaint_mask.shape[-1] != latent_sample_size:
+                    inpaint_mask = interpolate(
+                        inpaint_mask.unsqueeze(1), size=latent_sample_size, mode="nearest"
+                    ).squeeze(1)
+
+            # Build inpaint mask tensor and masked input
+            if inpaint_mask is None:
+                mask = torch.zeros((batch_size, 1, latent_sample_size), device=device)
+            else:
+                mask = inpaint_mask.unsqueeze(1)
+            mask = mask.to(device)
+
+            inpaint_input = (
+                inpaint_audio * mask.expand_as(inpaint_audio)
+                if inpaint_audio is not None
+                else torch.zeros(
+                    (batch_size, self.model.io_channels, latent_sample_size), device=device
+                )
+            )
+
+            conditioning_tensors["inpaint_mask"] = [mask]
+            conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
+            conditioning_inputs = self.model.get_conditioning_inputs(conditioning_tensors)
+
+            if negative_conditioning_tensors:
+                negative_conditioning_tensors["inpaint_mask"] = [mask]
+                negative_conditioning_tensors["inpaint_masked_input"] = [inpaint_input]
+                negative_conditioning_tensors = self.model.get_conditioning_inputs(
+                    negative_conditioning_tensors, negative=True
+                )
+
+            model_dtype = next(self.model.model.parameters()).dtype
+            noise = noise.type(model_dtype)
+            conditioning_inputs = {
+                k: v.type(model_dtype) if v is not None else v
+                for k, v in conditioning_inputs.items()
+            }
+
+            cond_inputs = {**conditioning_inputs, **negative_conditioning_tensors}
+
+            sampler_type = sampler_kwargs.pop("sampler_type", None)
+
+            result = sample_diffusion(
+                model=self.model.model,
+                noise=noise,
+                cond_inputs=cond_inputs,
+                diffusion_objective=self.model.diffusion_objective,
+                steps=steps,
+                cfg_scale=cfg_scale,
+                conditioning=conditioning,
+                sample_rate=self.model.sample_rate,
+                pretransform=self.model.pretransform,
+                mask_padding_attention=True,
+                use_effective_length_for_schedule=True,
+                headroom_seconds=duration_padding_sec,
+                dist_shift=dist_shift
+                if dist_shift is not None
+                else self.model.sampling_dist_shift,
+                sampler_type=sampler_type,
+                batch_cfg=True,
+                rescale_cfg=True,
+                apg_scale=apg_scale,
+                init_data=init_audio,
+                init_noise_level=init_noise_level,
+                truncate_schedule=truncate_schedule,
+                decode=not return_latents,
+                chunked_decode=chunked_decode,
+                **sampler_kwargs,
+            )
+
+            if not return_latents:
+                result = result.to(torch.float32).clamp(-1, 1)
+
+            if not return_latents and truncate_output_to_duration:
+                if isinstance(duration, (int, float)):
+                    max_length_samples = int(duration * self.model.sample_rate)
                     result = result[:, :, :max_length_samples]
                 else:
-                    # Warn that we can't truncate to a single duration if the durations are different, and return the full length output
-                    print(
-                        "Warning: Cannot truncate output to a single duration when passing a list of different durations"
-                    )
+                    if torch.all(torch.tensor(duration) == duration[0]):
+                        max_length_samples = int(duration[0] * self.model.sample_rate)
+                        result = result[:, :, :max_length_samples]
+                    else:
+                        # Warn that we can't truncate to a single duration if the durations are different, and return the full length output
+                        print(
+                            "Warning: Cannot truncate output to a single duration when passing a list of different durations"
+                        )
 
-        return result
+            return result
 
     # --- generate() helpers ---
 

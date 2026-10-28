@@ -1,4 +1,5 @@
 import torch
+from ..rng import randn_like as _rng_randn_like
 
 from torch import nn
 from torch.nn.utils import weight_norm
@@ -144,7 +145,7 @@ class TransformerResamplingBlock(nn.Module):
                 override_new_tokens = rearrange(override_new_tokens, 'b (n c) d -> (b n) c d', c = output_seg_size)
                 new_tokens = new_tokens + override_new_tokens
             elif self.mask_noise > 0:
-                new_tokens = new_tokens + torch.randn_like(new_tokens) * self.mask_noise
+                new_tokens = new_tokens + _rng_randn_like(new_tokens) * self.mask_noise   # the request's generator (rng.py)
             x = torch.cat([x,new_tokens], dim = -2)
             if prepend_cond is not None:
                 n = x.shape[0] // batch_size

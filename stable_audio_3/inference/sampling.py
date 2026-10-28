@@ -1,4 +1,5 @@
 import torch
+from ..rng import randn_like as _rng_randn_like
 import typing as tp
 from tqdm import trange, tqdm
 import torch.distributions as dist
@@ -396,7 +397,7 @@ def sample_flow_pingpong(model, x, sigmas, callback=None, disable_tqdm=False, **
         if callback is not None:
             callback({'x': x, 'i': i, 't': t_curr, 'sigma': t_curr, 'sigma_hat': t_curr, 'denoised': denoised})
 
-        x = (1 - t_next_broadcast) * denoised + t_next_broadcast * torch.randn_like(x)
+        x = (1 - t_next_broadcast) * denoised + t_next_broadcast * _rng_randn_like(x)   # the request's generator (rng.py)
 
     return x
 
