@@ -1,4 +1,5 @@
 from functools import reduce, partial
+import os
 from packaging import version
 import logging
 import math
@@ -125,6 +126,33 @@ def _sliding_window_additive_mask(seq_q, seq_k, w_left, w_right, device, dtype):
     in_band = (delta >= -int(w_left)) & (delta <= int(w_right))
     mask = torch.zeros((seq_q, seq_k), dtype=dtype, device=device)
     return mask.masked_fill(~in_band, float('-inf'))
+
+
+# Which kernel serves sliding-window attention (the SAME-L decoder's 17-token band).
+# SA3_SLIDING_WINDOW_ATTN = auto | flash | flex | halo | mask
+#   auto  (default) flash-attn when importable, else the chunked-halo masked SDPA
+#   flash           flash-attn or fail loudly
+#   flex            the compiled flex_attention band mask (the pre-2026-10 default)
+#   halo / mask     force one of the SDPA fallbacks (A/B tests)
+# Measured on a MIG 3g.20gb slice, 120 s SAME-L decode (Kollektiv, 28 Oct 2026): compiled
+# flex 6.23 s / +1.5 GB, chunked-halo SDPA 0.98 s / +175 MB, full masked SDPA 1.19 s,
+# flash-attn 2.8.3 0.71 s. Halo, mask and flash agree with each other exactly; flex differs
+# from them by 0.019 max abs on an rms-0.15 signal. Hence flex is opt-in now.
+_SLIDING_WINDOW_TIER = os.environ.get("SA3_SLIDING_WINDOW_ATTN", "auto").strip().lower() or "auto"
+
+
+def _resolve_sliding_window_tier(flash_available, flex_available, tier=None):
+    """The tier `apply_attn` uses for a sliding-window call, given what is importable."""
+    tier = (tier or _SLIDING_WINDOW_TIER)
+    if tier == "flash":
+        if not flash_available:
+            raise RuntimeError("SA3_SLIDING_WINDOW_ATTN=flash but flash_attn is not importable")
+        return "flash"
+    if tier == "flex":
+        return "flex" if flex_available else "halo"
+    if tier in ("halo", "mask"):
+        return tier
+    return "flash" if flash_available else "halo"
 
 
 # Chunked-halo SDPA fallback. Math-equivalent to masked SDPA with a band
@@ -649,7 +677,8 @@ class Attention(nn.Module):
             # Pad output back to original shape
             out = pad_input(out_unpad, indices, batch_size, seq_len)
             out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
-        elif flash_attn_available:
+        elif flash_attn_available and (flash_attn_sliding_window is None
+                                       or _resolve_sliding_window_tier(True, flex_attention_available) == "flash"):
             # Standard flash attention (no padding mask, or varlen imports not available)
             # Apply V-zeroing fallback if padding_mask provided but we couldn't use varlen
             if padding_mask is not None:
@@ -665,10 +694,12 @@ class Attention(nn.Module):
 
             out = rearrange(out.to(fa_dtype_in), 'b n h d -> b h n d')
         else:
-            # No flash-attn available. Sliding-window fallback cascade:
-            #   Tier 2: flex_attention with band block_mask (best when torch.compile works)
-            #   Tier 3: chunked-halo masked SDPA           (math-equivalent, ~30x faster than tier 4)
-            #   Tier 4: full masked SDPA (N x N mask)      (last resort; high memory)
+            # No flash-attn (or the tier forbids it). Sliding-window cascade, see
+            # _resolve_sliding_window_tier / SA3_SLIDING_WINDOW_ATTN:
+            #   flex : flex_attention with band block_mask — opt-in only (6x slower than halo
+            #          on a MIG slice and numerically the odd one out, measured 2026-10-28)
+            #   halo : chunked-halo masked SDPA            (default; exact band semantics)
+            #   mask : full masked SDPA (N x N mask)       (last resort; high memory)
             # For the no-sliding-window case, fall through to plain SDPA full attention.
             # All apply V-zeroing for padding masks (cheap and equivalent to masking
             # those positions out of attention output).
@@ -679,14 +710,15 @@ class Attention(nn.Module):
                 seq_q, seq_k = q.shape[2], k.shape[2]
                 wl, wr = flash_attn_sliding_window
                 handled = False
-                if flex_attention_available and flex_attention_compiled is not None:
+                tier = _resolve_sliding_window_tier(False, flex_attention_available and flex_attention_compiled is not None)
+                if tier == "flex":
                     try:
                         bm = _get_sliding_window_block_mask(seq_q, seq_k, wl, wr, q.device)
                         out = flex_attention_compiled(q, k, v, block_mask=bm)
                         handled = True
                     except Exception as _flex_err:
                         logging.debug(f"flex_attention failed, trying chunked-halo SDPA: {_flex_err}")
-                if not handled:
+                if not handled and tier != "mask":
                     try:
                         out = _sliding_window_chunked_halo_sdpa(q, k, v, wl, wr)
                         handled = True

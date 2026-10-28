@@ -34,4 +34,4 @@ from .utils import (
     prepare_dora_state_dict,
     resolve_adapter_type
 )
-from .loader import load_and_apply_loras
+from .loader import load_and_apply_loras, load_adapter_tensors
