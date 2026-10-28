@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from .blocks import FourierFeatures, ExpoFourierFeatures
 from .transformer import ContinuousTransformer        
 from .lora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
+from .lora.bank import current_session as _bank_current_session
 
 class DiffusionTransformer(nn.Module):
     def __init__(self,
@@ -455,7 +456,13 @@ class DiffusionTransformer(nn.Module):
         elif self.diffusion_objective in ["rectified_flow", "rf_denoiser"]:
             sigma = t
 
-        # LoRA interval
+        # Adapter bank (models/lora/bank.py): the request's session decides per step which adapters act,
+        # from this σ — nothing on the shared modules changes.
+        _sess = _bank_current_session()
+        if _sess is not None:
+            _sess.set_sigma(float(sigma[0]))
+
+        # LoRA interval (parametrize chain; no-op under the bank, which registers no parametrizations)
         if has_lora(self):
             if lora_configs is not None:
                 # Multi-LoRA: per-LoRA interval and layer filter

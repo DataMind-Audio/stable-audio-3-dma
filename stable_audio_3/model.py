@@ -62,13 +62,37 @@ class StableAudioModel:
         model.lora_names = []
         return StableAudioModel(model, model_config, device, model_half)
 
+    # ---- adapter bank: per-request LoRA stacks (models/lora/bank.py) ----
+    bank = None
+
+    def use_adapter_bank(self):
+        """Switch this model to the adapter bank. LoRAs then load once as resident tensors
+        (`load_lora`) and are applied per request, in the request's order, inside
+        `with bank.session(specs): model.generate(...)`. `set_lora_strength`,
+        `canonicalize_lora_order` and `lora_configs` become no-ops. Call before any
+        parametrize-based attach; the two mechanisms do not mix on one model."""
+        if self.bank is None:
+            from .models.lora.bank import AdapterBank
+            from .models.lora.utils import has_lora
+            if has_lora(self.model.model) or has_lora(self.model.conditioner):
+                raise RuntimeError("use_adapter_bank() must be called before any LoRA is attached via parametrize")
+            bank = AdapterBank()
+            bank.install({"dit": self.model.model, "cond": self.model.conditioner})
+            self.bank = bank
+        return self.bank
+
     def load_lora(self, lora_ckpt_paths, start_index=0):
         """Load LoRA checkpoints onto the model after construction.
 
         start_index: pass the count of LoRAs already loaded onto this model to
         add more incrementally, without re-registering (and thereby stacking
-        on top of) the ones already there.
+        on top of) the ones already there. Under the adapter bank the paths are
+        loaded as resident adapters (keyed by path) and start_index is ignored.
         """
+        if self.bank is not None:
+            for path in lora_ckpt_paths:
+                self.bank.load(path)
+            return
         model_type = self.model_config["model_type"]
         svd_bases_path = self.model_config.get("svd_bases_path")
         load_and_apply_loras(
@@ -77,6 +101,8 @@ class StableAudioModel:
         )
 
     def set_lora_strength(self, strength: float, lora_index: int | None = None):
+        if self.bank is not None:
+            return   # strengths live in the request's Session under the bank
         _set_lora_strength(self.model.model, strength, lora_index=lora_index)
         _set_lora_strength(self.model.conditioner, strength, lora_index=lora_index)
 
@@ -85,7 +111,9 @@ class StableAudioModel:
         the composition order depends only on which LoRAs are attached, not on
         the order this process attached them. Call after each ``load_lora``.
         See ``models.lora.canonicalize_lora_order`` for why DoRA needs this.
-        Returns the number of layers reordered."""
+        Returns the number of layers reordered (0 under the adapter bank: the request order IS the order)."""
+        if self.bank is not None:
+            return 0
         return (_canonicalize_lora_order(self.model.model, key_fn)
                 + _canonicalize_lora_order(self.model.conditioner, key_fn))
 
