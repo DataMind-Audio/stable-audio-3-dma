@@ -12,6 +12,8 @@ from torch import nn, einsum
 from torch.amp import autocast
 from torch.nn.utils.parametrizations import weight_norm
 from typing import Callable, Literal, Optional
+
+from .regions import current_plan as _current_region_plan
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
     flex_attention_available = True
@@ -731,9 +733,35 @@ class Attention(nn.Module):
                 out = F.scaled_dot_product_attention(q, k, v, is_causal=causal if causal is not None else False)
         return out
 
+    # The DiT's cross-attention modules are region sites (models/regions.py marks them): under a RegionPlan each
+    # latent frame reads its own mix of word sets. Everything else always takes _attend.
+    _region_site = False
+
+    def forward(
+        self,
+        x,
+        context = None,
+        rotary_pos_emb = None,
+        rotary_pos_emb_k = None,
+        causal = None,
+        flex_attention_block_mask = None,
+        flex_attention_score_mod = None,
+        flash_attn_sliding_window = None,
+        padding_mask = None,
+        varlen_metadata = None,
+    ):
+        kw = dict(rotary_pos_emb = rotary_pos_emb, rotary_pos_emb_k = rotary_pos_emb_k, causal = causal,
+                  flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod,
+                  flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask,
+                  varlen_metadata = varlen_metadata)
+        if context is not None and self._region_site:
+            plan = _current_region_plan()
+            if plan is not None:
+                return plan.cross_attention(self, x, context, kw, lambda x_, c_, **k_: self._attend(x_, c_, **k_))
+        return self._attend(x, context, **kw)
 
     #@compile
-    def forward(
+    def _attend(
         self,
         x,
         context = None,

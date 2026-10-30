@@ -10,6 +10,7 @@ from .blocks import FourierFeatures, ExpoFourierFeatures
 from .transformer import ContinuousTransformer        
 from .lora import LoRAParametrization, set_lora_strength, has_lora, enable_lora, disable_lora, filter_lora_layers
 from .lora.bank import current_session as _bank_current_session
+from .regions import current_plan as _current_region_plan, mark_region_sites as _mark_region_sites
 
 class DiffusionTransformer(nn.Module):
     def __init__(self,
@@ -135,6 +136,9 @@ class DiffusionTransformer(nn.Module):
         nn.init.zeros_(self.preprocess_conv.weight)
         self.postprocess_conv = nn.Conv1d(io_channels, io_channels, 1, bias=False)
         nn.init.zeros_(self.postprocess_conv.weight)
+
+        # cross-attention modules a RegionPlan may steer per latent frame (models/regions.py)
+        _mark_region_sites(self)
 
     # Fixed logsnr normalization range: maps logsnr to [0, 1] preserving direction (t=0→0, t=1→1)
     _LOGSNR_MIN = -12.0
@@ -380,6 +384,11 @@ class DiffusionTransformer(nn.Module):
 
         x = x.to(model_dtype)
 
+        # A RegionPlan (models/regions.py) needs the token count to tell the memory tokens from the frames
+        _rplan = _current_region_plan()
+        if _rplan is not None:
+            _rplan.tokens = x.shape[-1] // self.patch_size
+
         # Keep t in float32: the logsnr transform log((1-t)/t) amplifies bf16
         # quantization error ~380x near t=1, causing catastrophic conditioning errors.
         # t is a 1D batch-size tensor so float32 has zero memory impact.
@@ -612,7 +621,11 @@ class DiffusionTransformer(nn.Module):
                 diff_parallel, diff_orthogonal = self.apg_project(diff, cond_denoised, padding_mask=padding_mask)
                 cfg_diff = apg_scale * diff_orthogonal + (1 - apg_scale) * diff
 
-            cfg_denoised = cond_denoised + (cfg_scale - 1) * cfg_diff
+            if _rplan is not None and _rplan.guidance is not None:
+                # a guidance lane: the guided prediction is linear in the scale, so each frame gets its own
+                cfg_denoised = cond_denoised + (_rplan.lane(x.shape[-1], cfg_diff.device, cfg_diff.dtype) - 1) * cfg_diff
+            else:
+                cfg_denoised = cond_denoised + (cfg_scale - 1) * cfg_diff
                     
             if self.diffusion_objective == "v":
                 output = (x * alpha[:, None, None] - cfg_denoised) / sigma[:, None, None]

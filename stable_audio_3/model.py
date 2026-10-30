@@ -1,3 +1,4 @@
+import contextlib
 import json
 import numpy as np
 import torch
@@ -155,6 +156,8 @@ class StableAudioModel:
         apg_scale: float = 1.0,
         dist_shift=None,
         return_latents: bool = False,
+        # Kollektiv: the words (and guidance) per latent frame — a models.regions.RegionPlan
+        regions=None,
         chunked_decode: tp.Optional[bool] = None,
         **sampler_kwargs,
     ) -> torch.Tensor:
@@ -200,6 +203,10 @@ class StableAudioModel:
             apg_scale: APG (Adaptive Projected Guidance) scale. 1.0 = full APG, 0.0 = vanilla CFG.
             dist_shift: Optional distribution shift override for sampling. If None, uses model.sampling_dist_shift.
             return_latents: Whether to return the latents used for generation instead of the decoded audio.
+            regions: A models.regions.RegionPlan: K word sets mixed per latent frame, what the memory tokens read,
+                and optionally a guidance lane. The prompt still conditions the memory tokens (the shared words) and
+                the unconditional row. With a lane, CFG runs at the lane's maximum and cfg_scale is ignored. Batch
+                size 1 only.
             chunked_decode: Whether to decode latents in overlapping chunks to reduce peak VRAM. True forces
                 chunked decoding on, False forces it off, None (default) uses the value set in the model config.
             **sampler_kwargs: Additional keyword arguments to pass to the sampler.
@@ -324,6 +331,15 @@ class StableAudioModel:
             else:
                 negative_conditioning_tensors = {}
 
+            # Region words: encoded under the same adapter session and generator scope as the prompt
+            if regions is not None:
+                if batch_size != 1:
+                    raise ValueError("regions needs batch_size 1")
+                seconds_total = (conditioning[0].get("seconds_total") if conditioning else None) or duration
+                regions.prepare(self.model, device, seconds_total)
+                if regions.guidance is not None:
+                    cfg_scale = regions.guidance_max
+
             def _as_latent(lat, name):
                 # a pre-encoded latent for this exact window: (1, C, T) at latent_sample_size
                 if lat.dim() != 3 or lat.shape[0] != 1 or lat.shape[-1] != latent_sample_size:
@@ -393,33 +409,13 @@ class StableAudioModel:
 
             sampler_type = sampler_kwargs.pop("sampler_type", None)
 
-            result = sample_diffusion(
-                model=self.model.model,
-                noise=noise,
-                cond_inputs=cond_inputs,
-                diffusion_objective=self.model.diffusion_objective,
-                steps=steps,
-                cfg_scale=cfg_scale,
-                conditioning=conditioning,
-                sample_rate=self.model.sample_rate,
-                pretransform=self.model.pretransform,
-                mask_padding_attention=True,
-                use_effective_length_for_schedule=True,
-                headroom_seconds=duration_padding_sec,
-                dist_shift=dist_shift
-                if dist_shift is not None
-                else self.model.sampling_dist_shift,
-                sampler_type=sampler_type,
-                batch_cfg=True,
-                rescale_cfg=True,
-                apg_scale=apg_scale,
-                init_data=init_audio,
-                init_noise_level=init_noise_level,
-                truncate_schedule=truncate_schedule,
-                decode=not return_latents,
-                chunked_decode=chunked_decode,
-                **sampler_kwargs,
-            )
+            with (regions if regions is not None else contextlib.nullcontext()):
+                result = self._sample(
+                    sampler_type=sampler_type, noise=noise, cond_inputs=cond_inputs, steps=steps, cfg_scale=cfg_scale,
+                    conditioning=conditioning, duration_padding_sec=duration_padding_sec, dist_shift=dist_shift,
+                    apg_scale=apg_scale, init_audio=init_audio, init_noise_level=init_noise_level,
+                    truncate_schedule=truncate_schedule, return_latents=return_latents, chunked_decode=chunked_decode,
+                    **sampler_kwargs)
 
             if not return_latents:
                 result = result.to(torch.float32).clamp(-1, 1)
@@ -439,6 +435,38 @@ class StableAudioModel:
                         )
 
             return result
+
+    def _sample(self, *, sampler_type, noise, cond_inputs, steps, cfg_scale, conditioning, duration_padding_sec,
+                dist_shift, apg_scale, init_audio, init_noise_level, truncate_schedule, return_latents, chunked_decode,
+                **sampler_kwargs):
+        """generate()'s sampling call, unchanged; split out so a RegionPlan can be entered around it."""
+        return sample_diffusion(
+            model=self.model.model,
+            noise=noise,
+            cond_inputs=cond_inputs,
+            diffusion_objective=self.model.diffusion_objective,
+            steps=steps,
+            cfg_scale=cfg_scale,
+            conditioning=conditioning,
+            sample_rate=self.model.sample_rate,
+            pretransform=self.model.pretransform,
+            mask_padding_attention=True,
+            use_effective_length_for_schedule=True,
+            headroom_seconds=duration_padding_sec,
+            dist_shift=dist_shift
+            if dist_shift is not None
+            else self.model.sampling_dist_shift,
+            sampler_type=sampler_type,
+            batch_cfg=True,
+            rescale_cfg=True,
+            apg_scale=apg_scale,
+            init_data=init_audio,
+            init_noise_level=init_noise_level,
+            truncate_schedule=truncate_schedule,
+            decode=not return_latents,
+            chunked_decode=chunked_decode,
+            **sampler_kwargs,
+        )
 
     # --- generate() helpers ---
 
