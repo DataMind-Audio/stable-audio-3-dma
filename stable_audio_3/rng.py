@@ -14,6 +14,7 @@ same shapes they always did.
 """
 import contextlib
 import contextvars
+import math
 import typing as tp
 
 import torch
@@ -43,10 +44,45 @@ def seeded(seed: int, device) -> torch.Generator:
     return g
 
 
-def randn(*size, dtype=None, device=None, generator: tp.Optional[torch.Generator] = None) -> torch.Tensor:
+class Variation:
+    """Two streams mixed into one, variance kept: every draw is  ε = cos(c·π/2)·ε_seed + sin(c·π/2)·ε_var, c the strength.
+    c = 0 is the seed's stream exactly (bitwise), c = 1 the variation seed's exactly; between, a take that drifts away from
+    the seed's by degrees while every draw keeps unit variance (cos² + sin² = 1), so the sampler sees noise of the same
+    size. Scope it like a Generator (generator_scope); rng.randn / randn_like draw through it. The Studio's Chaos dial in
+    NEW mode (2026-11-02)."""
+
+    def __init__(self, base: torch.Generator, variant: torch.Generator, strength: float):
+        self.base, self.variant = base, variant
+        self.strength = float(min(1.0, max(0.0, strength)))
+        self.device = base.device
+        a = self.strength * math.pi / 2
+        self.wa, self.wb = math.cos(a), math.sin(a)
+
+    def randn(self, size, dtype=None, device=None) -> torch.Tensor:
+        if self.strength <= 0.0:
+            out = torch.randn(*size, dtype=dtype, device=self.device, generator=self.base)
+        elif self.strength >= 1.0:
+            out = torch.randn(*size, dtype=dtype, device=self.device, generator=self.variant)
+        else:
+            a = torch.randn(*size, dtype=dtype, device=self.device, generator=self.base)
+            b = torch.randn(*size, dtype=dtype, device=self.device, generator=self.variant)
+            out = a * self.wa + b * self.wb
+        return out if device is None or torch.device(device).type == out.device.type else out.to(device)
+
+
+def variation(seed: int, variation_seed: int, strength: float, device):
+    """The random source for a take: the seed's stream alone at strength 0, else a Variation of it towards variation_seed's."""
+    if strength is None or strength <= 0.0:
+        return seeded(seed, device)
+    return Variation(seeded(seed, device), seeded(variation_seed, device), strength)
+
+
+def randn(*size, dtype=None, device=None, generator=None) -> torch.Tensor:
     g = generator if generator is not None else _GEN.get()
     if len(size) == 1 and isinstance(size[0], (tuple, list, torch.Size)):
         size = tuple(size[0])
+    if isinstance(g, Variation):
+        return g.randn(size, dtype=dtype, device=device)
     if g is not None and torch.device(device or "cpu").type != g.device.type:
         # a CPU-scoped generator cannot draw on CUDA (or the reverse): draw where the generator lives, move after
         return torch.randn(*size, dtype=dtype, device=g.device, generator=g).to(device)
