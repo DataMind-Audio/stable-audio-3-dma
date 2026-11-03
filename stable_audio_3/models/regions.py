@@ -25,6 +25,18 @@ to 1.7e-3 per call in fp16 and 1e-5 in fp32 (tests/test_regions.py).
 Guidance lane. With scale_phi = 0 the guided prediction is linear in the scale — APG's projection and the norm
 threshold do not depend on it — so cond + (g − 1)·Δ gives each frame its own g at no cost. generate() runs CFG at the
 lane's maximum so the branch is taken whenever any frame wants guidance; the DiT's CFG combine reads the lane.
+
+Horizons (EXPERIMENTAL, 2026-11-03). A frame never reads a later section's words before that section's window (its
+weight there is 0), but it does see the later frames: self-attention spans the take, so a section about to change
+anticipates the next one (a hard cut at 55 s with strict guidance brought trap hats in at 48 s). `horizons` are
+times in seconds (the Studio sends a blind join's window start): a frame before a horizon attends only to the frames
+before it — the frames at or after the last horizon see the whole take, so a later section still hears what came
+before. Every other path across time goes with it: APG's projection and the norm threshold are taken per frame over
+the frames it may see (one scalar over the whole take otherwise), and the memory tokens, which attend to every frame,
+follow `memory_view`: 'prefix' (default) — they see only the frames before the first horizon, so the frames before it
+are sealed from everything after; 'open' — they see the whole take (a two-hop path from later frames remains);
+'hidden' — they see the whole take, and frames before a horizon do not see them. Under a plan without horizons
+nothing changes. The DiT's convolutions are kernel-1; the autoencoder's decode window still spans ~1–2 s of latent.
 """
 import contextvars
 
@@ -43,15 +55,21 @@ def current_plan():
 
 
 def mark_region_sites(dit) -> int:
-    """Flag the DiT's cross-attention modules as region sites. The conditioner's encoder and the autoencoder are not
-    DiT submodules, so their attention is never touched."""
+    """Flag the DiT's cross-attention modules as region sites and its self-attention modules as horizon sites. The
+    conditioner's encoder and the autoencoder are not DiT submodules, so their attention is never touched. Returns the
+    number of cross-attention sites."""
     from .transformer import TransformerBlock
     n = 0
     for m in dit.modules():
-        if isinstance(m, TransformerBlock) and getattr(m, "cross_attn", None) is not None:
-            m.cross_attn._region_site = True
-            n += 1
+        if isinstance(m, TransformerBlock):
+            m.self_attn._region_self_site = True
+            if getattr(m, "cross_attn", None) is not None:
+                m.cross_attn._region_site = True
+                n += 1
     return n
+
+
+MEMORY_VIEWS = ("prefix", "open", "hidden")
 
 
 def frame_times(n, patch, fps, device):
@@ -89,11 +107,20 @@ class RegionPlan:
               a negative weight extrapolates (probe 10 used -0.5 / 1.5).
     memory    None: the memory tokens read generate()'s own prompt (the shared words). Or a [K] mix of the sets.
     guidance  None, [T], or f(times) -> [T]: the guidance scale per frame. Needs `guidance_max` with a function.
+    horizons  EXPERIMENTAL: times in seconds; a frame before one attends only to the frames before it (module doc).
+    memory_view  with horizons: 'prefix' | 'open' | 'hidden' — what the memory tokens see and who sees them.
     """
 
-    def __init__(self, prompts, weights, memory=None, guidance=None, guidance_max=None):
+    def __init__(self, prompts, weights, memory=None, guidance=None, guidance_max=None, horizons=None,
+                 memory_view="prefix"):
         if not prompts:
             raise ValueError("a RegionPlan needs at least one word set")
+        if memory_view not in MEMORY_VIEWS:
+            raise ValueError(f"memory_view must be one of {MEMORY_VIEWS}, got {memory_view!r}")
+        self.horizons = sorted({float(h) for h in (horizons or [])})
+        if any(h <= 0 for h in self.horizons):
+            raise ValueError("horizons must be after the start of the take")
+        self.memory_view = memory_view
         self.prompts = list(prompts)
         self.weights = weights if callable(weights) else torch.as_tensor(weights, dtype=torch.float32)
         if not callable(self.weights) and (self.weights.dim() != 2 or self.weights.shape[0] != len(self.prompts)):
@@ -177,6 +204,82 @@ class RegionPlan:
         if key not in self._cache:
             self._cache[key] = self._frames_value(self.guidance, frames, 1, device, "guidance").to(dtype)[None, None, :]
         return self._cache[key]
+
+    # -- horizons: who may see whom across time ---------------------------------------------------------------------
+    def token_horizons(self, tseq, device):
+        """(times [tseq], horizon [tseq]): each sequence token's centre time and the first horizon after it (inf when
+        none: it sees the whole take)."""
+        key = ("h", tseq, str(device))
+        if key not in self._cache:
+            if self.fps is None:
+                raise RuntimeError("horizons are in seconds: prepare() (or fps) is needed")
+            t = frame_times(tseq, self.patch, self.fps, device)
+            hz = torch.full_like(t, float("inf"))
+            for h in reversed(self.horizons):
+                hz = torch.where(t < h, torch.full_like(t, h), hz)
+            self._cache[key] = (t, hz)
+        return self._cache[key]
+
+    def self_mask(self, n, tseq, device):
+        """bool [n, n], True = may attend: n = P memory (and prepend) tokens + tseq sequence tokens."""
+        key = ("m", n, tseq, str(device))
+        if key not in self._cache:
+            P = n - tseq
+            t, hz = self.token_horizons(tseq, device)
+            m = torch.ones(n, n, dtype=torch.bool, device=device)
+            m[P:, P:] = t[None, :] < hz[:, None]                 # a frame sees the frames before its horizon
+            if P > 0 and self.memory_view == "prefix":
+                m[:P, P:] = (t < self.horizons[0])[None, :]      # the memory sees the frames before the first horizon
+            elif P > 0 and self.memory_view == "hidden":
+                m[P:, :P] = ~torch.isfinite(hz)[:, None]         # frames before a horizon do not see the memory
+            self._cache[key] = m
+        return self._cache[key]
+
+    def self_attention(self, attn, x, kw, attend):
+        """One call of a horizon site. `attend(x, **kw)` is the module's own self-attention."""
+        tseq, n = self.tokens, x.shape[1]
+        if not self.horizons or tseq is None or tseq > n:
+            return attend(x, **kw)                   # not a DiT sequence this plan was published for
+        return attend(x, attn_mask=self.self_mask(n, tseq, x.device), **kw)
+
+    def frame_extent(self, T, device):
+        """long [T]: for each latent frame, how many latent frames from the start it may use — the frames before its
+        token's horizon (a prefix of the take), or all T."""
+        key = ("e", T, str(device))
+        if key not in self._cache:
+            p = max(1, int(self.patch))
+            tseq = T // p
+            t, hz = self.token_horizons(tseq, device)
+            visible = torch.searchsorted(t.contiguous(), hz.contiguous())       # tokens with t < horizon
+            ext = (visible * p).repeat_interleave(p)
+            if ext.numel() < T:
+                ext = torch.cat([ext, torch.full((T - ext.numel(),), T, dtype=ext.dtype, device=ext.device)])
+            self._cache[key] = ext.clamp(min=1, max=T)
+        return self._cache[key]
+
+    def apg_project(self, v0, v1, padding_mask=None):
+        """DiffusionTransformer.apg_project, each frame's projection taken over the frames it may see. Without
+        horizons every frame sees the take and this is the global projection (up to summation order)."""
+        dtype = v0.dtype
+        v0, v1 = v0.float(), v1.float()
+        idx = self.frame_extent(v0.shape[-1], v0.device) - 1
+        m = padding_mask.unsqueeze(1).float() if padding_mask is not None else None
+        v0m, v1m = (v0 * m, v1 * m) if m is not None else (v0, v1)
+        dot = (v0m * v1m).sum(1).cumsum(-1)[:, idx]                       # [B, T]
+        sq = (v1m * v1m).sum(1).cumsum(-1)[:, idx]
+        parallel = (dot / sq.clamp(min=1e-16))[:, None, :] * v1m
+        orthogonal = v0 - parallel
+        if m is not None:
+            orthogonal = orthogonal * m
+        return parallel.to(dtype), orthogonal.to(dtype)
+
+    def norm_threshold(self, diff, threshold, padding_mask=None):
+        """The CFG norm threshold, each frame's norm taken over the frames it may see."""
+        idx = self.frame_extent(diff.shape[-1], diff.device) - 1
+        d = diff.float() * padding_mask.unsqueeze(1).float() if padding_mask is not None else diff.float()
+        norm = (d * d).sum(1).cumsum(-1)[:, idx].sqrt()                  # [B, T]
+        scale = torch.minimum(torch.ones_like(norm), threshold / norm)
+        return diff * scale[:, None, :].to(diff.dtype)
 
     def _full_weights(self, w, n, P):
         """w [K, n-P] over the sequence tokens -> [K+1, n] with P memory tokens in front. They read the shared words

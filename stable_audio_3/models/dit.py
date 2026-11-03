@@ -597,8 +597,15 @@ class DiffusionTransformer(nn.Module):
                 uncond_denoised = x - uncond_output * sigma[:, None, None]
 
             diff = cond_denoised - uncond_denoised
-            
-            if cfg_norm_threshold > 0:
+
+            # under a RegionPlan with horizons the projection and the norm are taken per frame over the frames it may
+            # see, so nothing after a horizon reaches the frames before it through these global sums (models/regions.py)
+            _per_horizon = _rplan is not None and bool(getattr(_rplan, "horizons", None))
+            apg_project = _rplan.apg_project if _per_horizon else self.apg_project
+
+            if cfg_norm_threshold > 0 and _per_horizon:
+                diff = _rplan.norm_threshold(diff, cfg_norm_threshold, padding_mask)
+            elif cfg_norm_threshold > 0:
                 if padding_mask is not None:
                     # Only compute norm over valid positions
                     mask = padding_mask.unsqueeze(1).float()  # (B, 1, T)
@@ -614,11 +621,11 @@ class DiffusionTransformer(nn.Module):
                 cfg_diff = diff
             elif apg_scale == 1.0:
                 # Full APG: use only orthogonal component
-                _, diff_orthogonal = self.apg_project(diff, cond_denoised, padding_mask=padding_mask)
+                _, diff_orthogonal = apg_project(diff, cond_denoised, padding_mask=padding_mask)
                 cfg_diff = diff_orthogonal
             else:
                 # Blended APG: interpolate between full diff and orthogonal
-                diff_parallel, diff_orthogonal = self.apg_project(diff, cond_denoised, padding_mask=padding_mask)
+                diff_parallel, diff_orthogonal = apg_project(diff, cond_denoised, padding_mask=padding_mask)
                 cfg_diff = apg_scale * diff_orthogonal + (1 - apg_scale) * diff
 
             if _rplan is not None and _rplan.guidance is not None:

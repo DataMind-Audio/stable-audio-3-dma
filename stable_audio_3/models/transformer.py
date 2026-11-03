@@ -625,12 +625,20 @@ class Attention(nn.Module):
         return q, k
 
 
-    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None):
+    def apply_attn(self, q, k, v, causal = None, flex_attention_block_mask = None, flex_attention_score_mod = None, flash_attn_sliding_window = None, padding_mask = None, varlen_metadata = None, attn_mask = None):
 
         if self.num_heads != self.kv_heads:
              # Repeat interleave kv_heads to match q_heads for grouped query attention
              heads_per_kv_head = self.num_heads // self.kv_heads
              k, v = map(lambda t: t.repeat_interleave(heads_per_kv_head, dim = 1), (k, v))
+
+        if attn_mask is not None:
+            # A RegionPlan's horizon mask (models/regions.py): bool [n_q, n_k], True = may attend. Padded keys join
+            # it as False, so this path masks exactly (the V-zeroing fallbacks below keep padded keys in the softmax)
+            m = attn_mask
+            if padding_mask is not None:
+                m = m[None, None] & padding_mask[:, None, None, :].to(torch.bool)
+            return F.scaled_dot_product_attention(q, k, v, attn_mask=m, is_causal=False)
 
         flash_attn_available = flash_attn_func is not None
         flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None
@@ -734,8 +742,10 @@ class Attention(nn.Module):
         return out
 
     # The DiT's cross-attention modules are region sites (models/regions.py marks them): under a RegionPlan each
-    # latent frame reads its own mix of word sets. Everything else always takes _attend.
+    # latent frame reads its own mix of word sets. Its self-attention modules are horizon sites: under a plan with
+    # horizons a frame attends only to the frames before its next horizon. Everything else always takes _attend.
     _region_site = False
+    _region_self_site = False
 
     def forward(
         self,
@@ -758,6 +768,10 @@ class Attention(nn.Module):
             plan = _current_region_plan()
             if plan is not None:
                 return plan.cross_attention(self, x, context, kw, lambda x_, c_, **k_: self._attend(x_, c_, **k_))
+        if context is None and self._region_self_site:
+            plan = _current_region_plan()
+            if plan is not None and plan.horizons:
+                return plan.self_attention(self, x, kw, lambda x_, **k_: self._attend(x_, None, **k_))
         return self._attend(x, context, **kw)
 
     #@compile
@@ -773,6 +787,7 @@ class Attention(nn.Module):
         flash_attn_sliding_window = None,
         padding_mask = None,
         varlen_metadata = None,
+        attn_mask = None,
     ):
         h, kv_h, has_context = self.num_heads, self.kv_heads, context is not None
 
@@ -850,11 +865,11 @@ class Attention(nn.Module):
         if self.differential:
             q, q_diff = q.unbind(dim = 1)
             k, k_diff = k.unbind(dim = 1)
-            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
-            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out = self.apply_attn(q, k, v,  causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, attn_mask = attn_mask)
+            out_diff = self.apply_attn(q_diff, k_diff, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, attn_mask = attn_mask)
             out = out - out_diff
         else:
-            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata)
+            out = self.apply_attn(q, k, v, causal = causal, flex_attention_block_mask = flex_attention_block_mask, flex_attention_score_mod = flex_attention_score_mod, flash_attn_sliding_window = flash_attn_sliding_window, padding_mask = padding_mask, varlen_metadata = varlen_metadata, attn_mask = attn_mask)
         # merge heads
         out = rearrange(out, ' b h n d -> b n (h d)')
 
