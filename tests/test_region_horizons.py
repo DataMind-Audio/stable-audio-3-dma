@@ -119,10 +119,11 @@ def test_apg_and_the_norm_threshold_per_horizon():
 
 
 # ---- through a real (tiny) DiffusionTransformer ---------------------------------------------------------------------
-def _tiny_dit():
+def _tiny_dit(cond_type="adaLN"):
+    """adaLN like SA3 (no prepended token in front of the frames); 'prepend' puts the timestep in front as a token."""
     torch.manual_seed(3)
     dit = DiffusionTransformer(io_channels=4, embed_dim=128, cond_token_dim=16, depth=2, num_heads=2,
-                               diffusion_objective="rectified_flow", num_memory_tokens=3,
+                               diffusion_objective="rectified_flow", num_memory_tokens=3, global_cond_type=cond_type,
                                attn_kwargs={"differential": True, "qk_norm": "rms"}).eval()
     with torch.no_grad():                              # the zero-initialised convs and outputs would hide every difference
         dit.preprocess_conv.weight.normal_(0, 0.2)
@@ -156,8 +157,9 @@ def _render(dit, x, a, b, horizons, view, pm=None, **cfg):
                                  dict(cfg_scale=3.0, apg_scale=1.0, cfg_norm_threshold=0.5),
                                  dict(cfg_scale=3.0, apg_scale=0.4)], ids=["no-cfg", "apg+threshold", "apg-blend"])
 @pytest.mark.parametrize("padded", (False, True))
-def test_frames_before_a_horizon_ignore_everything_after_it(cfg, padded):
-    dit = _tiny_dit()
+@pytest.mark.parametrize("cond_type", ("adaLN", "prepend"))
+def test_frames_before_a_horizon_ignore_everything_after_it(cfg, padded, cond_type):
+    dit = _tiny_dit(cond_type)
     torch.manual_seed(4)
     x, a, b = torch.randn(1, 4, T), torch.randn(1, 9, 16), torch.randn(1, 9, 16)
     x2 = x.clone()
@@ -205,3 +207,9 @@ def test_split_lays_out_one_copy_per_stretch_on_the_dit_only():
             out = dit(x, torch.full((1,), 0.6), cross_attn_cond=torch.zeros(1, 9, 16), cfg_scale=1.0)
         assert plan.memory_copies == copies and out.shape == x.shape
     assert dit.transformer._region_memory_site is True
+    pre = _tiny_dit("prepend")                         # a token in front of the frames: no copies (the prefix view)
+    plan = RegionPlan(["a"], torch.ones(1, T), horizons=[H], memory_view="split")
+    plan.contexts, plan.fps, plan.patch = [pre.to_cond_embed(a)], FPS, 1
+    with torch.no_grad(), plan:
+        pre(x, torch.full((1,), 0.6), cross_attn_cond=torch.zeros(1, 9, 16), cfg_scale=1.0)
+    assert plan.memory_copies == 1
