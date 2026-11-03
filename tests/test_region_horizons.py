@@ -48,6 +48,25 @@ def test_the_mask_layout_for_each_memory_view():
         RegionPlan(["a"], torch.ones(1, 4), horizons=[1.0]).self_mask(4, 4, "cpu")     # seconds need the fps
 
 
+def test_the_split_mask_gives_each_stretch_its_own_memory_copy():
+    # horizons at 1 s and 2 s: three stretches, three copies of a 2-token memory in front (rows 0-1, 2-3, 4-5)
+    plan = _plan([1.0, 2.0], "split")
+    plan.memory_copies = 3
+    m = plan.self_mask(12, 6, "cpu")
+    F = m[6:, 6:]
+    assert torch.equal(F, torch.tensor([[1, 1, 0, 0, 0, 0], [1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 0, 0],
+                                        [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=torch.bool))
+    sees = lambda rows: m[rows, 6:][0]                                     # noqa: E731
+    assert sees(slice(0, 2)).tolist() == [1, 1, 0, 0, 0, 0]                 # copy 0 hears the first stretch
+    assert sees(slice(2, 4)).tolist() == [1, 1, 1, 1, 0, 0]                 # copy 1 the first two
+    assert sees(slice(4, 6)).tolist() == [1, 1, 1, 1, 1, 1]                 # the last copy the whole take
+    assert torch.equal(m[:6, :6], torch.block_diag(*[torch.ones(2, 2)] * 3).bool())   # copies never see each other
+    assert torch.equal(m[6:, :6], torch.tensor([[1, 1, 0, 0, 0, 0]] * 2 + [[0, 0, 1, 1, 0, 0]] * 2 + [[0, 0, 0, 0, 1, 1]] * 2,
+                                               dtype=torch.bool))          # each frame reads its own stretch's copy
+    plan.memory_copies = 1                                                  # no copies laid out: the prefix view
+    assert torch.equal(plan.self_mask(8, 6, "cpu")[:2, 2:], torch.tensor([[1, 1, 0, 0, 0, 0]] * 2, dtype=torch.bool))
+
+
 def _attn(diff, qk):
     torch.manual_seed(1)
     a = Attention(64, dim_heads=16, differential=diff, qk_norm=qk, zero_init_output=False).eval()
@@ -148,7 +167,7 @@ def test_frames_before_a_horizon_ignore_everything_after_it(cfg, padded):
     if padded:
         pm = torch.ones(1, T, dtype=torch.bool)
         pm[:, -3:] = False
-    for view in ("prefix", "hidden"):
+    for view in ("split", "prefix", "hidden"):
         one = _render(dit, x, a, b, [H], view, pm, **cfg)
         two = _render(dit, x2, a, b2, [H], view, pm, **cfg)
         assert float((one[..., :20] - two[..., :20]).abs().max()) < 1e-5, view
@@ -162,11 +181,27 @@ def test_frames_before_a_horizon_ignore_everything_after_it(cfg, padded):
     assert leak["open"] > 1e-6, leak                    # the open memory is a two-hop path
 
 
-def test_a_horizon_past_the_end_changes_nothing_but_the_kernel():
-    """Every frame before a horizon at 1000 s sees every frame: the masked path must give the plain result."""
+@pytest.mark.parametrize("view", ("split", "prefix"))
+def test_a_horizon_past_the_end_changes_nothing_but_the_kernel(view):
+    """Every frame before a horizon at 1000 s sees every frame: the masked path must give the plain result ('split':
+    the frames read copy 0, at the memory's own positions, which hears everything; the spare copy reaches nobody)."""
     dit = _tiny_dit()
     torch.manual_seed(5)
     x, a, b = torch.randn(1, 4, T), torch.randn(1, 9, 16), torch.randn(1, 9, 16)
-    plain = _render(dit, x, a, b, None, "prefix", cfg_scale=3.0, apg_scale=1.0)
-    far = _render(dit, x, a, b, [1000.0], "prefix", cfg_scale=3.0, apg_scale=1.0)
+    plain = _render(dit, x, a, b, None, view, cfg_scale=3.0, apg_scale=1.0)
+    far = _render(dit, x, a, b, [1000.0], view, cfg_scale=3.0, apg_scale=1.0)
     assert float((far - plain).abs().max() / plain.abs().max()) < 1e-5
+
+
+def test_split_lays_out_one_copy_per_stretch_on_the_dit_only():
+    dit = _tiny_dit()
+    torch.manual_seed(6)
+    x, a, b = torch.randn(1, 4, T), torch.randn(1, 9, 16), torch.randn(1, 9, 16)
+    times = (torch.arange(T) + 0.5) / FPS
+    for hz, copies in (([H], 2), ([1.0, H], 3)):
+        plan = RegionPlan(["a", "b"], torch.stack([(times < 2.5).float(), (times >= 2.5).float()]), horizons=hz, memory_view="split")
+        plan.contexts, plan.fps, plan.patch = [dit.to_cond_embed(a), dit.to_cond_embed(b)], FPS, 1
+        with torch.no_grad(), plan:
+            out = dit(x, torch.full((1,), 0.6), cross_attn_cond=torch.zeros(1, 9, 16), cfg_scale=1.0)
+        assert plan.memory_copies == copies and out.shape == x.shape
+    assert dit.transformer._region_memory_site is True

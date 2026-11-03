@@ -1191,6 +1191,7 @@ class ContinuousTransformer(nn.Module):
             self.cross_attn_rotary_pos_emb = None
 
         self.num_memory_tokens = num_memory_tokens
+        self._region_memory_site = False      # the DiT's own transformer: models/regions.py marks it
         if num_memory_tokens > 0:
             self.memory_tokens = nn.Parameter(torch.randn(num_memory_tokens, dim))
 
@@ -1265,12 +1266,29 @@ class ContinuousTransformer(nn.Module):
 
             x = torch.cat((prepend_embeds, x), dim = -2)
 
+        # A RegionPlan with horizons and the 'split' memory view (models/regions.py): one copy of the memory tokens per
+        # stretch between horizons, each at the memory's own positions, so every stretch has a memory that heard only
+        # what it may hear — and the last stretch's copy is today's memory exactly
+        n_mem, positions = self.num_memory_tokens, None
         if self.num_memory_tokens > 0:
             memory_tokens = self.memory_tokens.expand(batch, -1, -1)
+            copies = 1
+            _plan = _current_region_plan() if self._region_memory_site else None
+            if (_plan is not None and _plan.horizons and _plan.memory_view == "split" and prepend_embeds is None
+                    and not (self.use_sinusoidal_emb or self.use_abs_pos_emb)):
+                copies = len(_plan.horizons) + 1
+            if _plan is not None:
+                _plan.memory_copies = copies          # the plan's mask reads the layout from here
+            if copies > 1:
+                memory_tokens = memory_tokens.repeat(1, copies, 1)
+                n_mem = copies * self.num_memory_tokens
+                positions = torch.cat([torch.arange(self.num_memory_tokens, device=device).repeat(copies),
+                                       torch.arange(self.num_memory_tokens, self.num_memory_tokens + x.shape[1], device=device)])
             x = torch.cat((memory_tokens, x), dim=1)
 
         if self.rotary_pos_emb is not None:
-            rotary_pos_emb = self.rotary_pos_emb.forward_from_seq_len(x.shape[1])
+            rotary_pos_emb = (self.rotary_pos_emb.forward(positions) if positions is not None
+                              else self.rotary_pos_emb.forward_from_seq_len(x.shape[1]))
         else:
             rotary_pos_emb = None
 
@@ -1290,7 +1308,7 @@ class ContinuousTransformer(nn.Module):
         varlen_metadata = None
         if padding_mask is not None:
             # Compute total prepend length (memory tokens + prepend_embeds)
-            prepend_length = self.num_memory_tokens
+            prepend_length = n_mem
             if prepend_embeds is not None:
                 prepend_length += prepend_embeds.shape[1]
 
@@ -1330,14 +1348,14 @@ class ContinuousTransformer(nn.Module):
                 info["hidden_states"].append(x)
 
             if exit_layer_ix is not None and layer_ix == exit_layer_ix:
-                x = x[:, self.num_memory_tokens:, :]
+                x = x[:, n_mem:, :]
 
                 if return_info:
                     return x, info
                 
                 return x
 
-        x = x[:, self.num_memory_tokens:, :]
+        x = x[:, n_mem:, :]
 
         x = self.project_out(x)
 

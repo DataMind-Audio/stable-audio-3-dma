@@ -33,10 +33,13 @@ times in seconds (the Studio sends a blind join's window start): a frame before 
 before it — the frames at or after the last horizon see the whole take, so a later section still hears what came
 before. Every other path across time goes with it: APG's projection and the norm threshold are taken per frame over
 the frames it may see (one scalar over the whole take otherwise), and the memory tokens, which attend to every frame,
-follow `memory_view`: 'prefix' (default) — they see only the frames before the first horizon, so the frames before it
-are sealed from everything after; 'open' — they see the whole take (a two-hop path from later frames remains);
-'hidden' — they see the whole take, and frames before a horizon do not see them. Under a plan without horizons
-nothing changes. The DiT's convolutions are kernel-1; the autoencoder's decode window still spans ~1–2 s of latent.
+follow `memory_view`: 'split' (default) — one copy of them per stretch between horizons, at the memory's own positions,
+each seeing only its stretch's view (the last stretch's copy is today's memory, so the music after the last horizon
+renders as it would without horizons, given what came before); 'prefix' — one memory that sees only the frames before
+the first horizon (seals them too, but every later frame reads that memory: on the real model the later sections lost
+their style); 'open' — one memory that sees the whole take (a two-hop path from later frames remains); 'hidden' — the
+frames before a horizon do not see the memory (out of distribution: the real model rendered noise). Under a plan
+without horizons nothing changes. The DiT's convolutions are kernel-1; the autoencoder's decode window still spans ~1–2 s of latent.
 """
 import contextvars
 
@@ -58,9 +61,11 @@ def mark_region_sites(dit) -> int:
     """Flag the DiT's cross-attention modules as region sites and its self-attention modules as horizon sites. The
     conditioner's encoder and the autoencoder are not DiT submodules, so their attention is never touched. Returns the
     number of cross-attention sites."""
-    from .transformer import TransformerBlock
+    from .transformer import ContinuousTransformer, TransformerBlock
     n = 0
     for m in dit.modules():
+        if isinstance(m, ContinuousTransformer):
+            m._region_memory_site = True
         if isinstance(m, TransformerBlock):
             m.self_attn._region_self_site = True
             if getattr(m, "cross_attn", None) is not None:
@@ -69,7 +74,7 @@ def mark_region_sites(dit) -> int:
     return n
 
 
-MEMORY_VIEWS = ("prefix", "open", "hidden")
+MEMORY_VIEWS = ("split", "prefix", "open", "hidden")
 
 
 def frame_times(n, patch, fps, device):
@@ -108,11 +113,11 @@ class RegionPlan:
     memory    None: the memory tokens read generate()'s own prompt (the shared words). Or a [K] mix of the sets.
     guidance  None, [T], or f(times) -> [T]: the guidance scale per frame. Needs `guidance_max` with a function.
     horizons  EXPERIMENTAL: times in seconds; a frame before one attends only to the frames before it (module doc).
-    memory_view  with horizons: 'prefix' | 'open' | 'hidden' — what the memory tokens see and who sees them.
+    memory_view  with horizons: 'split' | 'prefix' | 'open' | 'hidden' — what the memory tokens see, who sees them.
     """
 
     def __init__(self, prompts, weights, memory=None, guidance=None, guidance_max=None, horizons=None,
-                 memory_view="prefix"):
+                 memory_view="split"):
         if not prompts:
             raise ValueError("a RegionPlan needs at least one word set")
         if memory_view not in MEMORY_VIEWS:
@@ -138,6 +143,7 @@ class RegionPlan:
         self.fps = None            # latent frames per second (prepare())
         self.patch = 1
         self.tokens = None         # tokens per sequence in the current DiT call (DiT.forward publishes it)
+        self.memory_copies = 1     # memory copies in front of them ('split': the DiT's transformer publishes it)
         self.fallbacks = 0         # calls that took the per-set reference path
         self._kv = {}
         self._cache = {}
@@ -222,13 +228,27 @@ class RegionPlan:
 
     def self_mask(self, n, tseq, device):
         """bool [n, n], True = may attend: n = P memory (and prepend) tokens + tseq sequence tokens."""
-        key = ("m", n, tseq, str(device))
+        G = int(getattr(self, "memory_copies", 1) or 1)
+        key = ("m", n, tseq, G, str(device))
         if key not in self._cache:
             P = n - tseq
             t, hz = self.token_horizons(tseq, device)
             m = torch.ones(n, n, dtype=torch.bool, device=device)
             m[P:, P:] = t[None, :] < hz[:, None]                 # a frame sees the frames before its horizon
-            if P > 0 and self.memory_view == "prefix":
+            if P > 0 and self.memory_view == "split" and G > 1 and P % G == 0:
+                # copy g of the memory (rows g·Pm …) is stretch g's: it sees itself and the frames stretch g sees, and
+                # only stretch g's frames see it (the transformer laid the copies out, ContinuousTransformer.forward)
+                Pm = P // G
+                group = torch.bucketize(t, torch.tensor(self.horizons, device=device, dtype=t.dtype), right=True)
+                bounds = list(self.horizons) + [float("inf")]
+                m[:P] = False
+                m[P:, :P] = False
+                for g in range(G):
+                    rows = slice(g * Pm, (g + 1) * Pm)
+                    m[rows, rows] = True
+                    m[rows, P:] = (t < bounds[g])[None, :]
+                    m[P:, rows] = (group == g)[:, None]
+            elif P > 0 and self.memory_view in ("prefix", "split"):   # (split without its copies: the prefix view)
                 m[:P, P:] = (t < self.horizons[0])[None, :]      # the memory sees the frames before the first horizon
             elif P > 0 and self.memory_view == "hidden":
                 m[P:, :P] = ~torch.isfinite(hz)[:, None]         # frames before a horizon do not see the memory
