@@ -246,3 +246,12 @@ def test_coefficients_come_back_on_the_site_device_in_fp32():
     tens = [bank.adapters[f"k{t}"].per_site[site.id] for t in (1, 2)]
     c = bank.coefficients(site, tens, [0.7, 0.4], ["k1", "k2"])
     assert c.dtype == torch.float32 and c.device == site.w_sq.device and c.shape == (site.w_sq.shape[0], 3)
+
+
+def test_to_f64_moves_before_it_casts():
+    """An MPS tensor must leave the device before it becomes float64 (MPS has no float64 and its copy kernel
+    refuses the cast). Pinned on the CPU: the result is float64 on the solve device, values intact."""
+    from stable_audio_3.models.lora.bank import to_f64
+    x = torch.randn(4, 3)
+    y = to_f64(x)
+    assert y.dtype == torch.float64 and y.device == torch.device("cpu") and torch.equal(y.float(), x)

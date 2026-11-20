@@ -70,6 +70,13 @@ def solve_device(dev: "torch.device | str") -> torch.device:
     return torch.device("cpu") if dev.type == "mps" else dev
 
 
+def to_f64(x: torch.Tensor) -> torch.Tensor:
+    """`x` as float64 on solve_device(x.device). The move comes BEFORE the cast: a single
+    `x.to("cpu", torch.float64)` from an MPS tensor is dispatched to the MPS copy kernel, which refuses
+    float64 ("Cannot convert a MPS Tensor to float64 dtype"); moved first, the cast is a CPU op."""
+    return x.to(solve_device(x.device)).to(torch.float64)
+
+
 @dataclass(eq=False)
 class SiteTensors:
     A: torch.Tensor                 # (r, in) in the model's dtype
@@ -344,8 +351,7 @@ class AdapterBank:
         gk = (site_id, key_j, key_k)
         g = self._gram.get(gk)
         if g is None:
-            wdev = solve_device(A_j.device)
-            g = A_j.to(wdev, torch.float64) @ A_k.to(wdev, torch.float64).T
+            g = to_f64(A_j) @ to_f64(A_k).T
             self._gram[gk] = g
             if key_j != key_k:
                 self._gram[(site_id, key_k, key_j)] = g.T
@@ -358,7 +364,7 @@ class AdapterBank:
         # so there the small operands come to the CPU and the fp32 coefficients go back (solve_device);
         # on CUDA and CPU nothing moves and the arithmetic is unchanged.
         wdev = solve_device(dev)
-        d64 = lambda x: x.to(wdev, torch.float64)  # noqa: E731
+        d64 = to_f64
         J = len(tens)
         G = torch.zeros(site.w_sq.shape[0], J + 1, J + 1, dtype=torch.float64, device=wdev)
         G[:, 0, 0] = d64(site.w_sq)

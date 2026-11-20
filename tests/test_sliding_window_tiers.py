@@ -56,3 +56,25 @@ def test_window_actually_limits_attention():
     banded = tr._sliding_window_chunked_halo_sdpa(q, k, v, 2, 2, chunk_size=16)
     full = F.scaled_dot_product_attention(q, k, v)
     assert not torch.allclose(banded, full, atol=1e-3)
+
+
+def test_flash_attn_is_never_used_off_cuda(monkeypatch):
+    """A machine with the flash-attn wheel but a CPU (or MPS) tensor: the SDPA path, not the CUDA-only kernel
+    (which raises 'Could not run … from the CPU backend'). Simulates the import by making the names non-None."""
+    import torch.nn.functional as F
+    from stable_audio_3.models.transformer import Attention
+
+    def boom(*a, **k):
+        raise AssertionError("flash_attn kernel called off CUDA")
+    monkeypatch.setattr(tr, "flash_attn_func", boom)
+    monkeypatch.setattr(tr, "flash_attn_varlen_func", boom)
+    monkeypatch.setattr(tr, "index_first_axis", boom)
+    torch.manual_seed(0)
+    attn = Attention(dim=16, dim_heads=8)
+    q, k, v = (torch.randn(1, 2, 12, 8) for _ in range(3))
+    out = attn.apply_attn(q, k, v, causal=False)
+    ref = F.scaled_dot_product_attention(q, k, v)
+    assert torch.allclose(out, ref, atol=1e-5)
+    pad = torch.ones(1, 12, dtype=torch.bool)
+    out2 = attn.apply_attn(q, k, v, causal=False, padding_mask=pad, varlen_metadata={"cu_seqlens": None})
+    assert torch.allclose(out2, ref, atol=1e-5)

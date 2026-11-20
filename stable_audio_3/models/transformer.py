@@ -640,8 +640,11 @@ class Attention(nn.Module):
                 m = m[None, None] & padding_mask[:, None, None, :].to(torch.bool)
             return F.scaled_dot_product_attention(q, k, v, attn_mask=m, is_causal=False)
 
-        flash_attn_available = flash_attn_func is not None
-        flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None
+        # flash-attn's kernels are CUDA-only: importable is not enough (a CPU or MPS tensor on a machine — or a
+        # pod — with the wheel installed raised "Could not run 'flash_attn::_flash_attn_varlen_forward' with
+        # arguments from the 'CPU' backend", 20 Nov 2026). Off-CUDA the SDPA tiers below take over.
+        flash_attn_available = flash_attn_func is not None and q.is_cuda
+        flash_attn_varlen_available = flash_attn_varlen_func is not None and index_first_axis is not None and q.is_cuda
 
         if causal and (flex_attention_block_mask is not None or flex_attention_score_mod is not None):
             flex_attention_block_mask = None
