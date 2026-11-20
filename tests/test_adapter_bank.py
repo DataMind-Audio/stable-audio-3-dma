@@ -220,3 +220,29 @@ def test_model_wrapper_dispatch_is_bank_aware():
     assert sam.use_adapter_bank() is bank and len(bank.sites) == 4
     sam.set_lora_strength(0.0)                      # no-op, no error
     assert sam.canonicalize_lora_order(lambda t: t) == 0
+
+
+# ── the float64 solve on a device without float64 (Apple's MPS, 20 Nov 2026) ─────────────────────────────────
+
+def test_solve_device_moves_only_mps_to_the_cpu():
+    from stable_audio_3.models.lora.bank import solve_device
+    assert solve_device(torch.device("cpu")) == torch.device("cpu")
+    assert solve_device("cuda") == torch.device("cuda")          # the pool's path is untouched
+    assert solve_device(torch.device("cuda:1")) == torch.device("cuda:1")
+    assert solve_device(torch.device("mps")) == torch.device("cpu")
+    assert solve_device("mps:0") == torch.device("cpu")
+
+
+def test_coefficients_come_back_on_the_site_device_in_fp32():
+    """The bank's coefficients are fp32 on the SITE's device whatever device the solve ran on (CPU here: the
+    toy roots live there; on MPS the solve itself moves, the result must not)."""
+    dit, cond = _roots()
+    bank = AdapterBank()
+    bank.install({"dit": dit, "cond": cond})
+    for tag in (1, 2):
+        sd, cfg = _checkpoint(tag)
+        bank.load_state(sd, cfg, key=f"k{tag}")
+    site = bank.sites[0]
+    tens = [bank.adapters[f"k{t}"].per_site[site.id] for t in (1, 2)]
+    c = bank.coefficients(site, tens, [0.7, 0.4], ["k1", "k2"])
+    assert c.dtype == torch.float32 and c.device == site.w_sq.device and c.shape == (site.w_sq.shape[0], 3)

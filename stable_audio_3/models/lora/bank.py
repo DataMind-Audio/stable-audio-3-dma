@@ -62,6 +62,14 @@ class Site:
         return self.root != "dit"
 
 
+def solve_device(dev: "torch.device | str") -> torch.device:
+    """Where the bank's float64 coefficient solve runs for tensors living on `dev`: the same device, except
+    Apple's MPS backend, which has no float64 — there the (rank-sized) operands go to the CPU and the fp32
+    coefficients come back. A 2026-11-20 change for the Player on Apple Silicon; CUDA and CPU are untouched."""
+    dev = torch.device(dev)
+    return torch.device("cpu") if dev.type == "mps" else dev
+
+
 @dataclass(eq=False)
 class SiteTensors:
     A: torch.Tensor                 # (r, in) in the model's dtype
@@ -336,7 +344,8 @@ class AdapterBank:
         gk = (site_id, key_j, key_k)
         g = self._gram.get(gk)
         if g is None:
-            g = A_j.double() @ A_k.double().T
+            wdev = solve_device(A_j.device)
+            g = A_j.to(wdev, torch.float64) @ A_k.to(wdev, torch.float64).T
             self._gram[gk] = g
             if key_j != key_k:
                 self._gram[(site_id, key_k, key_j)] = g.T
@@ -345,21 +354,26 @@ class AdapterBank:
     def coefficients(self, site: Site, tens: list, strengths: list, keys: list) -> torch.Tensor:
         """(out, J+1) fp32: c₀ for the base row and c_k for each active adapter, sequential composition in list order."""
         dev = site.w_sq.device
+        # The solve is float64 (the per-row norms of a DoRA stack cancel badly in fp32). MPS has no float64,
+        # so there the small operands come to the CPU and the fp32 coefficients go back (solve_device);
+        # on CUDA and CPU nothing moves and the arithmetic is unchanged.
+        wdev = solve_device(dev)
+        d64 = lambda x: x.to(wdev, torch.float64)  # noqa: E731
         J = len(tens)
-        G = torch.zeros(site.w_sq.shape[0], J + 1, J + 1, dtype=torch.float64, device=dev)
-        G[:, 0, 0] = site.w_sq.double()
+        G = torch.zeros(site.w_sq.shape[0], J + 1, J + 1, dtype=torch.float64, device=wdev)
+        G[:, 0, 0] = d64(site.w_sq)
         needs_gram = any(t.kind == "dora-rows" for t in tens)
         if needs_gram:
             for k, t in enumerate(tens):
                 if t.WA is None:
                     with torch.no_grad():
                         t.WA = site.module.weight.detach().float() @ t.A.float().T
-                G[:, 0, k + 1] = G[:, k + 1, 0] = t.scaling * (t.WA.double() * t.B.double()).sum(1)
+                G[:, 0, k + 1] = G[:, k + 1, 0] = t.scaling * (d64(t.WA) * d64(t.B)).sum(1)
             for j, tj in enumerate(tens):
                 for k, tk in enumerate(tens):
                     AA = self.gram_AA(site.id, keys[j], keys[k], tj.A, tk.A)
-                    G[:, j + 1, k + 1] = tj.scaling * tk.scaling * ((tj.B.double() @ AA) * tk.B.double()).sum(1)
-        c = torch.zeros(site.w_sq.shape[0], J + 1, dtype=torch.float64, device=dev)
+                    G[:, j + 1, k + 1] = tj.scaling * tk.scaling * ((d64(tj.B) @ AA) * d64(tk.B)).sum(1)
+        c = torch.zeros(site.w_sq.shape[0], J + 1, dtype=torch.float64, device=wdev)
         c[:, 0] = 1.0
         for k, (t, s) in enumerate(zip(tens, strengths)):
             if s == 0:
@@ -367,8 +381,8 @@ class AdapterBank:
             c[:, k + 1] += s
             if t.kind == "dora-rows":
                 n2 = torch.einsum("oi,oij,oj->o", c, G, c).clamp_min(0.0)
-                c = c * (t.mag.double() / (n2.sqrt() + 1e-12)).unsqueeze(1)
-        return c.float()
+                c = c * (d64(t.mag) / (n2.sqrt() + 1e-12)).unsqueeze(1)
+        return c.float().to(dev)
 
     # -- sessions --------------------------------------------------------------------------------------------
     def session(self, specs: list, generator=None) -> Session:
